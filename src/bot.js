@@ -141,7 +141,34 @@ function fmtDuration(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-bot.on('message:text', async (ctx) => {
+// Задача целиком (скачать + отправить) не дольше этого: загрузка + 30 минут на отправку
+// большого файла. Иначе одна повисшая отправка держит задачу вечно.
+const JOB_TIMEOUT_MS = (config.downloadTimeoutSec + 1800) * 1000;
+
+class JobTimeoutError extends UserFacingError {
+  constructor() {
+    super('⏱️ Не получилось отправить файл за отведённое время. Попробуй ещё раз.');
+    this.name = 'JobTimeoutError';
+  }
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new JobTimeoutError()), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// Работу НЕ ждём: grammY берёт следующее сообщение, только когда обработчик вернулся.
+// Соседний tiktok-бот на той же архитектуре 08.11.2026 встал на 4,5 дня из-за одной
+// зависшей отправки. Обработчик сразу отпускает очередь сообщений, задача живёт отдельно
+// (параллельность ограничивает очередь загрузок).
+bot.on('message:text', (ctx) => {
+  handleLink(ctx).catch((e) => console.error('[bot] Задача упала мимо обработчика:', e));
+});
+
+async function handleLink(ctx) {
   const rawText = ctx.message.text.trim();
   if (rawText.startsWith('/')) return;
 
@@ -168,6 +195,7 @@ bot.on('message:text', async (ctx) => {
 
   let job;
   try {
+    await withTimeout((async () => {
     job = await enqueueDownload(() => downloadYouTube(result.url, { audioOnly }));
 
     await ctx.api.editMessageText(status.chat.id, status.message_id, '📤 Отправляю…').catch(() => {});
@@ -186,6 +214,7 @@ bot.on('message:text', async (ctx) => {
         supports_streaming: true,
       });
     }
+    })(), JOB_TIMEOUT_MS);
     stats.ok++;
     logUsage({ userId: ctx.from.id, username: ctx.from.username, ok: true, audio: audioOnly });
     await ctx.api.deleteMessage(status.chat.id, status.message_id).catch(() => {});
@@ -199,7 +228,7 @@ bot.on('message:text', async (ctx) => {
   } finally {
     if (job?.jobDir) await cleanupJob(job.jobDir); // файл всегда удаляем сразу после отправки
   }
-});
+}
 
 bot.catch((err) => {
   console.error('[bot] Ошибка обработчика:', err.error);

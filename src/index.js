@@ -33,10 +33,31 @@ async function main() {
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
 
+  startWatchdog();
+
   await bot.start({
     drop_pending_updates: true,
     onStart: (info) => console.log(`[index] Бот @${info.username} запущен.`),
   });
+}
+
+// Сторож: если у Telegram копятся непрочитанные сообщения, бот перестал их забирать
+// (процесс жив, а сообщения не читаются). Три проверки подряд (15 минут) — выходим,
+// pm2 поднимет заново.
+function startWatchdog() {
+  let strikes = 0;
+  setInterval(async () => {
+    try {
+      const info = await bot.api.getWebhookInfo();
+      strikes = info.pending_update_count > 0 ? strikes + 1 : 0;
+      if (strikes >= 3) {
+        console.error(`[watchdog] ${info.pending_update_count} сообщений не забраны 15 минут — перезапуск`);
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error('[watchdog] проверка не удалась:', e.message);
+    }
+  }, 5 * 60_000);
 }
 
 main().catch((err) => {
